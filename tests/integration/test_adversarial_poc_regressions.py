@@ -257,3 +257,68 @@ def test_hardlink_blocked_and_kernel_drivers_build_expected_arguments(tmp_path: 
     assert "(allow process-fork)" in sb_argv[2]
     assert "--unshare-all" in bw_argv
     assert "--die-with-parent" in bw_argv
+
+
+def test_round2_regressions_attached_flags_symlink_args_kernel_env_write_uri_jwt_redos_streaming(
+    tmp_path: Path,
+) -> None:
+    # 1. ARRANGE
+    ws = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    (ws / ".env").write_text("INTERNAL_ENV_SECRET=12345\n", encoding="utf-8")
+    os.symlink(ws / ".env", ws / "alias.txt")
+    (ws / "db.py").write_text(
+        'DATABASE_URL = "postgresql://admin:SuperSecretDbPass99@db.internal:5432/prod"\n'
+        'JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"\n',
+        encoding="utf-8",
+    )
+    (ws / "huge.log").write_text("log line content\n" * 180_000 + "final_tail", encoding="utf-8")
+
+    policy = SandboxPolicy(workspace_root=ws, allow_write=True, allow_exec=True)
+    srv = _init_and_make_server(policy)
+
+    # 2. ACT
+    err_r1, p_r1 = _call_tool(srv, 1, "exec_command", {"binary": "git", "args": [f"-C{outside}", "status"]})
+    err_r2, p_r2 = _call_tool(srv, 2, "exec_command", {"binary": "head", "args": ["alias.txt"]})
+    _call_tool(srv, 3, "exec_python", {"code": "open('.env', 'w').write('PWN=1')"})
+    err_r4, p_r4 = _call_tool(srv, 4, "fs_read_file", {"path": "db.py"})
+    err_r5, p_r5 = _call_tool(
+        srv,
+        5,
+        "fs_search_text",
+        {"query": "a+a+a+a+!$", "is_regex": True, "path": "db.py"},
+    )
+    err_r6, p_r6 = _call_tool(
+        srv,
+        6,
+        "fs_read_file",
+        {"path": "huge.log", "start_line": 1, "end_line": 5},
+    )
+    err_r6_tail, p_r6_tail = _call_tool(
+        srv,
+        7,
+        "fs_read_file",
+        {"path": "huge.log", "start_line": 180_000, "end_line": 180_001},
+    )
+
+    # 3. ASSERT
+    assert err_r1 is True
+    assert p_r1["code"] in ("ERR_JAIL_ESCAPE", "ERR_DANGEROUS_ARGUMENTS")
+    assert err_r2 is True
+    assert p_r2["code"] == "ERR_SYMLINK_BLOCKED"
+    assert (ws / ".env").read_text(encoding="utf-8") == "INTERNAL_ENV_SECRET=12345\n"
+    assert err_r4 is False
+    assert "[REDACTED_URI_PASSWORD]" in p_r4["content"]
+    assert "[REDACTED_JWT_TOKEN]" in p_r4["content"]
+    assert "SuperSecretDbPass99" not in p_r4["content"]
+    assert err_r5 is True
+    assert p_r5["code"] == "ERR_INVALID_REGEX"
+    assert err_r6 is False
+    assert p_r6["start_line"] == 1
+    assert p_r6["end_line"] == 5
+    assert p_r6["total_lines"] == 180_001
+    assert err_r6_tail is False
+    assert "final_tail" in p_r6_tail["content"]
+

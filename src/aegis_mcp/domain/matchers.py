@@ -168,6 +168,18 @@ _INLINE_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[REDACTED_GOOGLE_API_KEY]"),
     # Slack Tokens
     (re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,255}\b"), "[REDACTED_SLACK_TOKEN]"),
+    # Raw JSON Web Tokens (JWT - 3 base64url segments starting with eyJ)
+    (
+        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+        "[REDACTED_JWT_TOKEN]",
+    ),
+    # Database and Basic-Auth Connection URIs (postgresql://user:pass@host, redis://:pass@host, etc.)
+    (
+        re.compile(
+            r"\b((?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?|https?|ftp)://[^:\s/'\"]*:)(?!\[REDACTED_)([^@\s'\"]+)(@)"
+        ),
+        r"\1[REDACTED_URI_PASSWORD]\3",
+    ),
     # Authorization Bearer / Basic Headers
     (
         re.compile(r"(?i)\b(Authorization\s*:\s*(?:Bearer|Basic)\s+)[^\s\"',;]+"),
@@ -184,7 +196,7 @@ _INLINE_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 
 _REDACTED_MARKER_RE = re.compile(
-    r"\[REDACTED_(?:SECRET|AWS_KEY|GITHUB_TOKEN|API_KEY|GOOGLE_API_KEY|SLACK_TOKEN|AUTH_TOKEN|PEM_PRIVATE_KEY)\]"
+    r"\[REDACTED_(?:SECRET|AWS_KEY|GITHUB_TOKEN|API_KEY|GOOGLE_API_KEY|SLACK_TOKEN|AUTH_TOKEN|PEM_PRIVATE_KEY|JWT_TOKEN|URI_PASSWORD)\]"
 )
 
 
@@ -282,6 +294,13 @@ class CommandArgumentGuard:
             _, val = arg.split("=", 1)
             if val:
                 candidates.append(val)
+        elif (
+            len(arg) > 2
+            and arg.startswith("-")
+            and not arg.startswith("--")
+            and ("/" in arg[2:] or "\\" in arg[2:] or "~" in arg[2:] or ".." in arg[2:])
+        ):
+            candidates.append(arg[2:])
 
         for token in candidates:
             clean = token.strip()
@@ -329,6 +348,19 @@ class CommandArgumentGuard:
                         detail=f"Argument '{arg}' targets a protected file: {reason}.",
                         is_security_violation=True,
                     )
+                # Walk components to check for symlinks and resolved target sensitivity
+                curr = policy.workspace_root
+                for part in Path(clean).parts:
+                    if part in ("", "."):
+                        continue
+                    curr = curr / part
+                    if os.path.islink(curr) and not policy.allow_symlinks_within_jail:
+                        return DomainError(
+                            code=ErrorCode.ERR_SYMLINK_BLOCKED,
+                            title="Symlink Argument Blocked",
+                            detail=f"Argument '{arg}' traverses symbolic link '{part}', which is forbidden.",
+                            is_security_violation=True,
+                        )
                 candidate_path = policy.workspace_root / clean
                 if os.path.lexists(candidate_path):
                     resolved = Path(os.path.realpath(candidate_path))
@@ -337,6 +369,15 @@ class CommandArgumentGuard:
                             code=ErrorCode.ERR_JAIL_ESCAPE,
                             title="Symlink Escape Blocked In Command Argument",
                             detail=f"Argument '{arg}' resolves outside the workspace sandbox.",
+                            is_security_violation=True,
+                        )
+                    resolved_rel = resolved.relative_to(policy.workspace_root).as_posix()
+                    is_sens_target, target_reason = SensitiveFileMatcher.is_sensitive(resolved_rel)
+                    if is_sens_target:
+                        return DomainError(
+                            code=ErrorCode.ERR_SENSITIVE_PATH_BLOCKED,
+                            title="Symlink To Sensitive File Blocked In Command Argument",
+                            detail=f"Argument '{arg}' resolves to protected file: {target_reason}.",
                             is_security_violation=True,
                         )
         return None
@@ -405,7 +446,11 @@ class CommandArgumentGuard:
         # Git-specific guardrails
         if clean_bin == "git":
             for arg in normalized_args:
-                if arg in _FORBIDDEN_GIT_EXACT_FLAGS:
+                if (
+                    arg in _FORBIDDEN_GIT_EXACT_FLAGS
+                    or (arg.startswith("-C") and len(arg) > 2)
+                    or (arg.startswith("-c") and len(arg) > 2)
+                ):
                     return Err(
                         DomainError(
                             code=ErrorCode.ERR_DANGEROUS_ARGUMENTS,

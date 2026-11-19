@@ -46,11 +46,13 @@ _SKIP_SEARCH_DIRS: frozenset[str] = frozenset(
 # 2. Quantified group with alternation: (a|aa)+, (foo|foobar)*
 # 3. Quantified nested groups: ((a)+)+
 # 4. Backreferences: \1 .. \9
+# 5. Polynomial chained quantifiers without parentheses: a+a+a+, .*.*.*
 _REDOS_HAZARD_RE = re.compile(
     r"(?:\([^()]*[+*?{][^()]*\)\s*[+*?{])"
     r"|(?:\([^()]*\|[^()]*\)\s*[+*?{])"
     r"|(?:\((?:[^()]*\([^()]*\))+[^()]*\)\s*[+*?{])"
     r"|(?:\\[1-9])"
+    r"|(?:(?:[^\s()|+*{?]+(?:\+|\*|\{[0-9,]+\})\s*){3,})"
 )
 
 
@@ -321,6 +323,117 @@ class PosixJailFileSystem:
         finally:
             os.close(fd)
 
+    def _stream_large_text_file(
+        self,
+        target_path: Path,
+        rel_posix: str,
+        *,
+        start_line: int,
+        end_line: int | None,
+        byte_limit: int,
+    ) -> Result[FileReadResult, DomainError]:
+        """Stream a large regular file in O(1) 64KB chunks without loading the entire file into RAM."""
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(target_path), flags)
+        except OSError as exc:
+            return Err(
+                DomainError(
+                    code=ErrorCode.ERR_VALIDATION_FAILED,
+                    title="File Open Error",
+                    detail=f"Unable to open '{rel_posix}': {exc.strerror}",
+                )
+            )
+
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return Err(
+                    DomainError(
+                        code=ErrorCode.ERR_SPECIAL_FILE_BLOCKED,
+                        title="Special Device or FIFO Blocked",
+                        detail=f"Path '{rel_posix}' is not a regular file.",
+                        is_security_violation=True,
+                    )
+                )
+
+            hasher = hashlib.sha256()
+            selected_lines: list[str] = []
+            collected_bytes = 0
+            truncated = False
+            current_line_no = 0
+            remainder = b""
+            first_chunk = True
+
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                if first_chunk:
+                    first_chunk = False
+                    if b"\x00" in chunk[:8192]:
+                        return Err(
+                            DomainError(
+                                code=ErrorCode.ERR_BINARY_FILE,
+                                title="Binary File Rejected",
+                                detail=f"File '{rel_posix}' appears to be a binary file.",
+                            )
+                        )
+                hasher.update(chunk)
+                buf = remainder + chunk
+                lines = buf.split(b"\n")
+                remainder = lines.pop()
+
+                for raw_line in lines:
+                    current_line_no += 1
+                    if current_line_no < start_line:
+                        continue
+                    if end_line is not None and current_line_no > end_line:
+                        continue
+                    if not truncated:
+                        line_str = raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
+                        line_bytes = len(line_str.encode("utf-8")) + 1
+                        if collected_bytes + line_bytes > byte_limit:
+                            truncated = True
+                        else:
+                            selected_lines.append(line_str)
+                            collected_bytes += line_bytes
+
+            if remainder:
+                current_line_no += 1
+                if (
+                    current_line_no >= start_line
+                    and (end_line is None or current_line_no <= end_line)
+                    and not truncated
+                ):
+                    line_str = remainder.rstrip(b"\r").decode("utf-8", errors="replace")
+                    if collected_bytes + len(line_str.encode("utf-8")) <= byte_limit:
+                        selected_lines.append(line_str)
+                    else:
+                        truncated = True
+
+            joined = "\n".join(selected_lines)
+            if truncated:
+                joined += f"\n... [AEGIS SANDBOX: Output truncated at {byte_limit} bytes limit] ..."
+            scrubbed_text, redaction_count = SecretRedactor.redact_text(joined)
+            actual_end = start_line - 1 + len(selected_lines) if selected_lines else start_line
+
+            return Ok(
+                FileReadResult(
+                    relative_path=rel_posix,
+                    content=scrubbed_text,
+                    sha256=hasher.hexdigest(),
+                    total_bytes=st.st_size,
+                    start_line=start_line,
+                    end_line=actual_end,
+                    total_lines=current_line_no,
+                    truncated=truncated,
+                    secrets_redacted=redaction_count,
+                )
+            )
+        finally:
+            os.close(fd)
+
     def read_text_file(
         self,
         rel_path: str,
@@ -335,7 +448,21 @@ class PosixJailFileSystem:
 
         target_path = path_res.unwrap()
         rel_posix = self._to_rel_posix(target_path)
+        byte_limit = max_bytes if max_bytes is not None else self._policy.max_read_bytes
         hard_cap = max(self._policy.max_write_bytes, self._policy.max_read_bytes * 4)
+
+        try:
+            st = os.lstat(target_path)
+            if stat.S_ISREG(st.st_mode) and st.st_size > hard_cap and st.st_size <= 104_857_600:
+                return self._stream_large_text_file(
+                    target_path,
+                    rel_posix,
+                    start_line=start_line,
+                    end_line=end_line,
+                    byte_limit=byte_limit,
+                )
+        except OSError:
+            pass
 
         raw_res = self._read_regular_file_bytes(target_path, rel_posix, max_size=hard_cap)
         if raw_res.is_err:

@@ -49,8 +49,8 @@ _SEATBELT_DENY_READ_REGEXES: tuple[str, ...] = (
 _SEATBELT_ALLOW_READ_REGEXES: tuple[str, ...] = (r"/\.env\.(example|template|sample|dist)$",)
 
 # Paths inside the workspace that sandboxed code must never be able to modify, because
-# the host later executes or trusts them outside the sandbox (git hooks, direnv, IDE tasks).
-_WRITE_PROTECTED_SUBPATHS: tuple[str, ...] = (".git/hooks", ".vscode", ".idea")
+# the host later executes or trusts them outside the sandbox (git hooks/config, CI workflows, direnv, IDE tasks).
+_WRITE_PROTECTED_SUBPATHS: tuple[str, ...] = (".git", ".github", ".vscode", ".idea")
 _WRITE_PROTECTED_LITERALS: tuple[str, ...] = (".git/config", ".envrc")
 
 _SKIP_SCAN_DIRS: frozenset[str] = frozenset(
@@ -117,6 +117,8 @@ class SeatbeltDriver:
             protected = [f"(subpath {_sb_string(f'{ws}/{p}')})" for p in _WRITE_PROTECTED_SUBPATHS]
             protected += [f"(literal {_sb_string(f'{ws}/{p}')})" for p in _WRITE_PROTECTED_LITERALS]
             lines.append(f"(deny file-write* {' '.join(protected)})")
+            lines.append(f"(deny file-write* {deny_regex})")
+            lines.append(f"(allow file-write* {allow_regex})")
         lines.append(f"(allow file-write* (subpath {_sb_string(scratch)}))")
         lines.append('(allow file-write-data (literal "/dev/null"))')
         lines.append('(allow file-ioctl (literal "/dev/null"))')
