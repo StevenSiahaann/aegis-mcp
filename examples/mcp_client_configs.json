@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "aegis-sandbox-readonly": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "aegis_mcp",
+        "--root",
+        "/path/to/your/workspace",
+        "--wrap-untrusted"
+      ]
+    },
+    "aegis-sandbox-full": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "aegis_mcp",
+        "--root",
+        "/path/to/your/workspace",
+        "--allow-write",
+        "--allow-exec",
+        "--timeout",
+        "5.0",
+        "--max-output-bytes",
+        "65536"
+      ]
+    }
+  }
+}
+
