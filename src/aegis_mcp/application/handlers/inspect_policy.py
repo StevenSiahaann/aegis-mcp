@@ -42,6 +42,7 @@ class InspectPolicyHandler:
                 "rlimit_nofile": self._policy.rlimit_nofile,
             },
             "allowed_binaries": sorted(self._policy.allowed_binaries),
+            "extra_read_paths": [str(p) for p in self._policy.extra_read_paths],
             "telemetry": self._telemetry.snapshot(),
         }
         return Ok(report)

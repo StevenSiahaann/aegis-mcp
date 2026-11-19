@@ -10,6 +10,12 @@ import re
 import stat
 from collections import deque
 from pathlib import Path
+from typing import Any
+
+try:
+    import re2 as _re2_engine  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    _re2_engine = None
 
 from aegis_mcp.application.ports import (
     DirectoryEntryItem,
@@ -899,21 +905,24 @@ class PosixJailFileSystem:
 
         start_node = path_res.unwrap()
 
-        compiled_re: re.Pattern[str] | None = None
+        compiled_re: Any = None
         if is_regex:
             if _REDOS_HAZARD_RE.search(query):
                 return Err(
                     DomainError(
                         code=ErrorCode.ERR_INVALID_REGEX,
                         title="Catastrophic Backtracking Regex Blocked (ReDoS Guard)",
-                        detail="Regular expression contains nested quantifiers that pose a ReDoS risk.",
+                        detail="Regular expression contains nested or chained quantifiers that pose a ReDoS risk.",
                         is_security_violation=True,
                         context={"query": query},
                     )
                 )
             try:
-                compiled_re = re.compile(query)
-            except re.error as exc:
+                if _re2_engine is not None:
+                    compiled_re = _re2_engine.compile(query)
+                else:
+                    compiled_re = re.compile(query)
+            except Exception as exc:
                 return Err(
                     DomainError(
                         code=ErrorCode.ERR_INVALID_REGEX,

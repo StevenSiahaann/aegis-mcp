@@ -90,7 +90,8 @@ class SeatbeltDriver:
     def build_profile(self) -> str:
         ws = str(self.policy.workspace_root)
         scratch = str(self.policy.sandbox_scratch_dir)
-        read_roots = [*_DARWIN_SYSTEM_READ_PATHS, ws, *_runtime_read_roots()]
+        extra_reads = [str(p) for p in self.policy.extra_read_paths]
+        read_roots = [*_DARWIN_SYSTEM_READ_PATHS, ws, *_runtime_read_roots(), *extra_reads]
         read_clause = " ".join(f"(subpath {_sb_string(p)})" for p in read_roots)
 
         lines = [
@@ -188,6 +189,9 @@ class BubblewrapDriver:
         ]
         for prefix in _runtime_read_roots():
             args += ["--ro-bind-try", prefix, prefix]
+        for extra_p in self.policy.extra_read_paths:
+            ep_str = str(extra_p)
+            args += ["--ro-bind-try", ep_str, ep_str]
         args += ["--bind" if self.policy.allow_write else "--ro-bind", ws, ws]
         args += ["--bind", scratch, scratch]
         for rel in (*_WRITE_PROTECTED_SUBPATHS, *_WRITE_PROTECTED_LITERALS):

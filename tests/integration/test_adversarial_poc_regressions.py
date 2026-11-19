@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -321,4 +322,99 @@ def test_round2_regressions_attached_flags_symlink_args_kernel_env_write_uri_jwt
     assert p_r6["total_lines"] == 180_001
     assert err_r6_tail is False
     assert "final_tail" in p_r6_tail["content"]
+
+
+def test_in_flight_cancellation_extra_read_paths_and_re2_engine(tmp_path: Path) -> None:
+    # 1. ARRANGE
+    ws = tmp_path / "ws"
+    shared_ro = tmp_path / "shared_ro"
+    secret_dir = tmp_path / "secret_dir"
+    ws.mkdir()
+    shared_ro.mkdir()
+    secret_dir.mkdir()
+    (shared_ro / "lib_data.txt").write_text("SHARED_LIBRARY_CONTENT_OK\n", encoding="utf-8")
+    (secret_dir / "forbidden.txt").write_text("FORBIDDEN_OUTSIDE\n", encoding="utf-8")
+    (ws / "code.py").write_text("def handler_v1():\n    return 123\n", encoding="utf-8")
+
+    policy = SandboxPolicy(
+        workspace_root=ws,
+        allow_write=True,
+        allow_exec=True,
+        default_timeout_seconds=10.0,
+        extra_read_paths=(shared_ro,),
+    )
+    srv = _init_and_make_server(policy)
+
+    cancel_result_holder: list[tuple[bool, dict[str, Any]]] = []
+
+    def _run_long_task() -> None:
+        res = _call_tool(
+            srv,
+            777,
+            "exec_python",
+            {"code": "import time\nprint('started_777', flush=True)\ntime.sleep(10)", "timeout_seconds": 10.0},
+        )
+        cancel_result_holder.append(res)
+
+    worker = threading.Thread(target=_run_long_task)
+
+    # 2. ACT
+    t0 = time.perf_counter()
+    worker.start()
+    time.sleep(0.2)
+    srv.dispatcher.handle_raw_line(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 777},
+            }
+        )
+    )
+    worker.join(timeout=3.0)
+    cancel_elapsed = time.perf_counter() - t0
+
+    # Extra read path allowed for read, denied for write, and sibling secret_dir still denied
+    err_ro_read, p_ro_read = _call_tool(
+        srv,
+        801,
+        "exec_python",
+        {"code": f"print(open({str(shared_ro / 'lib_data.txt')!r}).read().strip())"},
+    )
+    _, p_ro_write = _call_tool(
+        srv,
+        802,
+        "exec_python",
+        {"code": f"open({str(shared_ro / 'hack.txt')!r}, 'w').write('x')"},
+    )
+    _, p_sec_read = _call_tool(
+        srv,
+        803,
+        "exec_python",
+        {"code": f"print(open({str(secret_dir / 'forbidden.txt')!r}).read())"},
+    )
+    err_re2, p_re2 = _call_tool(
+        srv,
+        804,
+        "fs_search_text",
+        {"query": r"def\s+handler_v[0-9]+", "is_regex": True, "path": "code.py"},
+    )
+
+    # 3. ASSERT
+    assert len(cancel_result_holder) == 1
+    c_err, c_payload = cancel_result_holder[0]
+    assert c_err is True
+    assert c_payload["code"] == "ERR_EXEC_TIMEOUT"
+    assert c_payload["context"]["cancelled"] is True
+    assert cancel_elapsed < 2.0
+
+    assert err_ro_read is False
+    assert p_ro_read["stdout"].strip() == "SHARED_LIBRARY_CONTENT_OK"
+    assert p_ro_write["exit_code"] != 0
+    assert (shared_ro / "hack.txt").exists() is False
+    assert p_sec_read["exit_code"] != 0
+    assert "FORBIDDEN_OUTSIDE" not in p_sec_read.get("stdout", "")
+
+    assert err_re2 is False
+    assert len(p_re2["matches"]) == 1
 

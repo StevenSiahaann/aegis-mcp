@@ -227,7 +227,11 @@ def test_stdio_server_serve_forever_loop_and_telemetry(tmp_path: Path) -> None:
     # 1. ARRANGE
     policy = SandboxPolicy(workspace_root=tmp_path)
     in_stream = io.StringIO(
-        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+        + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         + "\n"
         + json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 99}})
         + "\n\n"
@@ -246,8 +250,7 @@ def test_stdio_server_serve_forever_loop_and_telemetry(tmp_path: Path) -> None:
     out_lines = [line for line in out_stream.getvalue().splitlines() if line.strip()]
 
     # 3. ASSERT
-    assert len(out_lines) == 1
-    assert json.loads(out_lines[0])["result"] == {}
+    assert len(out_lines) == 3
     assert server.telemetry.snapshot()["total_requests"] == 0
 
 

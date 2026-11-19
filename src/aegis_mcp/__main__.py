@@ -83,6 +83,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated list of allowed binaries for exec_command.",
     )
     parser.add_argument(
+        "--extra-read-paths",
+        type=str,
+        default=None,
+        help="Comma-separated list of additional read-only directory paths permitted inside the kernel sandbox.",
+    )
+    parser.add_argument(
         "--audit-log",
         type=Path,
         default=None,
@@ -100,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
         parsed_bins = frozenset(b.strip() for b in args.allowed_binaries.split(",") if b.strip())
         binaries = parsed_bins
 
+    extra_reads: tuple[Path, ...] = ()
+    if args.extra_read_paths is not None:
+        extra_reads = tuple(
+            Path(p.strip()) for p in args.extra_read_paths.split(",") if p.strip()
+        )
+
     try:
         policy = SandboxPolicy(
             workspace_root=args.root,
@@ -113,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             default_timeout_seconds=args.timeout,
             max_timeout_seconds=args.max_timeout,
             allowed_binaries=binaries,
+            extra_read_paths=extra_reads,
         )
     except ValueError as exc:
         logger = NDJSONLogger(service_name="aegis-mcp", stream=sys.stderr)
