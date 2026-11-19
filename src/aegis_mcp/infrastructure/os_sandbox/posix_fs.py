@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import importlib
 import os
 import re
 import stat
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    import re2 as _re2_engine  # type: ignore[import-untyped]
+    _re2_engine: Any = importlib.import_module("re2")
 except ImportError:  # pragma: no cover
     _re2_engine = None
 
