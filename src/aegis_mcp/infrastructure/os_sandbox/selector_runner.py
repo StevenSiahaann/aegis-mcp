@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -18,12 +19,11 @@ from aegis_mcp.domain.matchers import SecretRedactor
 from aegis_mcp.domain.policy import SandboxPolicy
 from aegis_mcp.domain.result import Err, Ok, Result
 from aegis_mcp.domain.uuidv7 import generate_uuidv7
+from aegis_mcp.infrastructure.observability.context import get_current_trace_context
 from aegis_mcp.infrastructure.os_sandbox.env_builder import CleanEnvironmentBuilder
+from aegis_mcp.infrastructure.os_sandbox.kernel_sandbox import select_kernel_sandbox
 from aegis_mcp.infrastructure.os_sandbox.posix_fs import PosixJailFileSystem
-from aegis_mcp.infrastructure.os_sandbox.rlimits import (
-    build_macos_seatbelt_profile,
-    make_preexec_limiter,
-)
+from aegis_mcp.infrastructure.os_sandbox.rlimits import make_preexec_limiter
 
 
 class SelectorSandboxRunner:
@@ -32,6 +32,19 @@ class SelectorSandboxRunner:
     def __init__(self, policy: SandboxPolicy, fs: PosixJailFileSystem) -> None:
         self._policy = policy
         self._fs = fs
+        self._lock = threading.Lock()
+        self._active_pids: dict[str | int, int] = {}
+        self._cancelled_requests: set[str | int] = set()
+
+    def cancel_request(self, request_id: str | int) -> bool:
+        """Cancel an in-flight execution by its JSON-RPC request_id via process-group SIGKILL."""
+        with self._lock:
+            self._cancelled_requests.add(request_id)
+            pid = self._active_pids.get(request_id)
+        if pid is not None:
+            self._kill_process_group(pid)
+            return True
+        return False
 
     @staticmethod
     def _kill_process_group(pid: int) -> None:
@@ -54,20 +67,30 @@ class SelectorSandboxRunner:
         clean_env = CleanEnvironmentBuilder.build(self._policy)
 
         effective_argv = list(argv)
-        if self._policy.enable_seatbelt and sys.platform == "darwin":
-            sb_bin = shutil.which("sandbox-exec")
-            if sb_bin:
-                profile = build_macos_seatbelt_profile(
-                    self._policy.workspace_root,
-                    allow_write=self._policy.allow_write,
-                )
-                effective_argv = [sb_bin, "-p", profile, *effective_argv]
+        if self._policy.enable_seatbelt or self._policy.require_kernel_sandbox:
+            kernel_driver = select_kernel_sandbox(self._policy)
+            if kernel_driver is None:
+                if self._policy.require_kernel_sandbox:
+                    return Err(
+                        DomainError(
+                            code=ErrorCode.ERR_KERNEL_SANDBOX_UNAVAILABLE,
+                            title="Kernel Sandbox Driver Unavailable (Fail-Closed)",
+                            detail=(
+                                "No OS kernel sandbox backend (macOS sandbox-exec or Linux bubblewrap) "
+                                "is available on this host, and require_kernel_sandbox is enabled."
+                            ),
+                            is_security_violation=True,
+                        )
+                    )
+            else:
+                effective_argv = kernel_driver.wrap(effective_argv, cwd=cwd)
 
         cpu_limit = max(int(timeout_seconds) + 2, self._policy.rlimit_cpu_seconds)
         preexec = make_preexec_limiter(
             cpu_seconds=cpu_limit,
             fsize_bytes=self._policy.rlimit_fsize_bytes,
             nofile=self._policy.rlimit_nofile,
+            as_bytes=self._policy.rlimit_as_bytes,
         )
 
         start_ns = time.perf_counter_ns()
@@ -99,6 +122,13 @@ class SelectorSandboxRunner:
         assert proc.stdout is not None
         assert proc.stderr is not None
 
+        req_id = get_current_trace_context().request_id
+        if req_id is not None:
+            with self._lock:
+                self._active_pids[req_id] = proc.pid
+                if req_id in self._cancelled_requests:
+                    self._kill_process_group(proc.pid)
+
         stdout_fd = proc.stdout.fileno()
         stderr_fd = proc.stderr.fileno()
         os.set_blocking(stdout_fd, False)
@@ -110,6 +140,7 @@ class SelectorSandboxRunner:
         stdout_truncated = False
         stderr_truncated = False
         timed_out = False
+        cancelled = False
 
         sel = selectors.DefaultSelector()
         sel.register(stdout_fd, selectors.EVENT_READ, data="stdout")
@@ -117,6 +148,14 @@ class SelectorSandboxRunner:
 
         try:
             while sel.get_map():
+                if req_id is not None:
+                    with self._lock:
+                        if req_id in self._cancelled_requests:
+                            cancelled = True
+                            timed_out = True
+                            self._kill_process_group(proc.pid)
+                            break
+
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
@@ -174,7 +213,16 @@ class SelectorSandboxRunner:
             finally:
                 # Ensure any lingering grandchild processes in the session group are cleaned up
                 self._kill_process_group(proc.pid)
+                if req_id is not None:
+                    with self._lock:
+                        if req_id in self._cancelled_requests:
+                            cancelled = True
+                            timed_out = True
         finally:
+            if req_id is not None:
+                with self._lock:
+                    self._active_pids.pop(req_id, None)
+                    self._cancelled_requests.discard(req_id)
             sel.close()
             proc.stdout.close()
             proc.stderr.close()
@@ -194,16 +242,22 @@ class SelectorSandboxRunner:
         total_redactions = out_redactions + err_redactions
 
         if timed_out:
+            reason_title = (
+                "Execution Cancelled By Client (Process Group SIGKILL)"
+                if cancelled
+                else "Execution Timed Out (Process Group SIGKILL)"
+            )
             return Err(
                 DomainError(
                     code=ErrorCode.ERR_EXEC_TIMEOUT,
-                    title="Execution Timed Out (Process Group SIGKILL)",
+                    title=reason_title,
                     detail=(
-                        f"Execution of '{command_summary}' exceeded timeout limit of "
-                        f"{timeout_seconds:.2f}s and was terminated via process-group SIGKILL."
+                        f"Execution of '{command_summary}' was terminated via process-group SIGKILL "
+                        f"(cancelled={cancelled}, timeout={timeout_seconds:.2f}s)."
                     ),
                     context={
                         "command": command_summary,
+                        "cancelled": cancelled,
                         "timeout_seconds": timeout_seconds,
                         "duration_ms": round(duration_ms, 2),
                         "partial_stdout": clean_stdout,

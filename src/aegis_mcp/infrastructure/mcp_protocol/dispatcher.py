@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from aegis_mcp import __version__
@@ -14,6 +15,7 @@ from aegis_mcp.infrastructure.mcp_protocol.models import (
     JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
+    JSONRPC_SERVER_NOT_INITIALIZED,
     SUPPORTED_MCP_VERSIONS,
 )
 from aegis_mcp.infrastructure.mcp_protocol.registry import ToolRegistry
@@ -24,9 +26,15 @@ from aegis_mcp.infrastructure.observability.logger import NDJSONLogger
 class MCPDispatcher:
     """Routes raw JSON-RPC 2.0 frames through the MCP lifecycle and tool registry."""
 
-    def __init__(self, registry: ToolRegistry, logger: NDJSONLogger) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        logger: NDJSONLogger,
+        on_cancel: Callable[[str | int], bool] | None = None,
+    ) -> None:
         self._registry = registry
         self._logger = logger
+        self._on_cancel = on_cancel
         self._initialized = False
 
     @staticmethod
@@ -163,10 +171,14 @@ class MCPDispatcher:
             self._initialized = True
             self._logger.info("MCP_CLIENT_INITIALIZED", "MCP client completed initialization handshake")
         elif method == "notifications/cancelled":
+            req_id = params.get("requestId")
+            killed = False
+            if isinstance(req_id, (str, int)) and self._on_cancel is not None:
+                killed = self._on_cancel(req_id)
             self._logger.info(
                 "MCP_REQUEST_CANCELLED",
                 "Client sent cancellation notification",
-                context={"requestId": params.get("requestId")},
+                context={"requestId": req_id, "terminated_in_flight": killed},
             )
 
     def _handle_request(
@@ -209,6 +221,14 @@ class MCPDispatcher:
 
         if method == "ping":
             return self._make_result_response(req_id, {})
+
+        if not self._initialized:
+            return self._make_error_response(
+                req_id,
+                JSONRPC_SERVER_NOT_INITIALIZED,
+                "Server not initialized: client must send 'initialize' before invoking MCP methods",
+                data={"trace_id": trace_id},
+            )
 
         if method == "tools/list":
             return self._make_result_response(

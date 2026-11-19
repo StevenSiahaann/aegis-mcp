@@ -41,7 +41,9 @@ class SandboxPolicy:
     allow_write: bool = False
     allow_exec: bool = False
     allow_symlinks_within_jail: bool = False
-    enable_seatbelt: bool = False
+    enable_seatbelt: bool = True
+    require_kernel_sandbox: bool = True
+    allow_subprocess: bool = False
     wrap_untrusted_content: bool = False
     max_read_bytes: int = 65_536
     max_write_bytes: int = 2_097_152
@@ -52,8 +54,10 @@ class SandboxPolicy:
     max_search_results: int = 100
     rlimit_cpu_seconds: int = 10
     rlimit_fsize_bytes: int = 10_485_760
+    rlimit_as_bytes: int = 536_870_912
     rlimit_nofile: int = 64
     allowed_binaries: frozenset[str] = field(default_factory=lambda: DEFAULT_ALLOWED_BINARIES)
+    extra_read_paths: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         resolved_root = Path(os.path.realpath(self.workspace_root))
@@ -61,7 +65,19 @@ class SandboxPolicy:
             raise ValueError(f"Workspace root does not exist: {self.workspace_root}")
         if not resolved_root.is_dir():
             raise ValueError(f"Workspace root is not a directory: {self.workspace_root}")
+        if resolved_root == Path("/"):
+            raise ValueError("Workspace root cannot be the filesystem root '/'")
         object.__setattr__(self, "workspace_root", resolved_root)
+
+        resolved_extras: list[Path] = []
+        for extra in self.extra_read_paths:
+            rp = Path(os.path.realpath(extra))
+            if not rp.exists() or not rp.is_dir():
+                raise ValueError(f"Extra read path does not exist or is not a directory: {extra}")
+            if rp == Path("/"):
+                raise ValueError("Extra read path cannot be the filesystem root '/'")
+            resolved_extras.append(rp)
+        object.__setattr__(self, "extra_read_paths", tuple(resolved_extras))
 
         if self.max_read_bytes <= 0 or self.max_read_bytes > 10_485_760:
             raise ValueError("max_read_bytes must be between 1 and 10,485,760 bytes")

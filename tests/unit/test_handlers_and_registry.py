@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from aegis_mcp.__main__ import build_arg_parser
+from aegis_mcp.__main__ import build_arg_parser, main
 from aegis_mcp.domain.policy import SandboxPolicy
 from aegis_mcp.infrastructure.mcp_protocol.stdio_server import StdioMCPServer
 from aegis_mcp.infrastructure.os_sandbox.env_builder import CleanEnvironmentBuilder
@@ -18,6 +18,10 @@ from aegis_mcp.infrastructure.os_sandbox.rlimits import (
 
 
 def _rpc_call(server: StdioMCPServer, req_id: int, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if not server.dispatcher._initialized:
+        server.dispatcher.handle_raw_line(
+            json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+        )
     raw = server.dispatcher.handle_raw_line(
         json.dumps(
             {
@@ -223,7 +227,11 @@ def test_stdio_server_serve_forever_loop_and_telemetry(tmp_path: Path) -> None:
     # 1. ARRANGE
     policy = SandboxPolicy(workspace_root=tmp_path)
     in_stream = io.StringIO(
-        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+        + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         + "\n"
         + json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 99}})
         + "\n\n"
@@ -242,8 +250,7 @@ def test_stdio_server_serve_forever_loop_and_telemetry(tmp_path: Path) -> None:
     out_lines = [line for line in out_stream.getvalue().splitlines() if line.strip()]
 
     # 3. ASSERT
-    assert len(out_lines) == 1
-    assert json.loads(out_lines[0])["result"] == {}
+    assert len(out_lines) == 3
     assert server.telemetry.snapshot()["total_requests"] == 0
 
 
@@ -271,3 +278,7 @@ def test_clean_env_builder_and_rlimits_and_cli_parser(tmp_path: Path) -> None:
     assert callable(limiter_fn)
     assert parsed_args.allow_write is True
     assert parsed_args.allow_exec is True
+
+    # Verify CLI main() rejects nonexistent workspace root cleanly with exit code 2
+    rc_bad = main(["--root", str(tmp_path / "nonexistent_dir"), "--allowed-binaries", "git,ls"])
+    assert rc_bad == 2

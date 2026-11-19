@@ -10,6 +10,12 @@ import re
 import stat
 from collections import deque
 from pathlib import Path
+from typing import Any
+
+try:
+    import re2 as _re2_engine  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    _re2_engine = None
 
 from aegis_mcp.application.ports import (
     DirectoryEntryItem,
@@ -41,8 +47,19 @@ _SKIP_SEARCH_DIRS: frozenset[str] = frozenset(
     }
 )
 
-# Heuristic detector for catastrophic backtracking regexes (nested quantifiers)
-_REDOS_HAZARD_RE = re.compile(r"\([^()]*[+*][^()]*\)[+*?{]")
+# Heuristic detector for catastrophic backtracking regexes:
+# 1. Quantified group with inner quantifiers: (a+)+, (a*)*, ([a-z]+){2,}
+# 2. Quantified group with alternation: (a|aa)+, (foo|foobar)*
+# 3. Quantified nested groups: ((a)+)+
+# 4. Backreferences: \1 .. \9
+# 5. Polynomial chained quantifiers without parentheses: a+a+a+, .*.*.*
+_REDOS_HAZARD_RE = re.compile(
+    r"(?:\([^()]*[+*?{][^()]*\)\s*[+*?{])"
+    r"|(?:\([^()]*\|[^()]*\)\s*[+*?{])"
+    r"|(?:\((?:[^()]*\([^()]*\))+[^()]*\)\s*[+*?{])"
+    r"|(?:\\[1-9])"
+    r"|(?:(?:[^\s()|+*{?]+(?:\+|\*|\{[0-9,]+\})\s*){3,})"
+)
 
 
 class PosixJailFileSystem:
@@ -93,9 +110,9 @@ class PosixJailFileSystem:
                     DomainError(
                         code=ErrorCode.ERR_JAIL_ESCAPE,
                         title="Sandbox Boundary Violation",
-                        detail=f"Absolute path '{clean_input}' escapes workspace root '{self._root}'.",
+                        detail="Requested absolute path escapes the workspace sandbox root.",
                         is_security_violation=True,
-                        context={"requested_path": clean_input},
+                        context={"requested_path": "<outside_workspace>"},
                     )
                 )
 
@@ -141,11 +158,11 @@ class PosixJailFileSystem:
                             code=ErrorCode.ERR_JAIL_ESCAPE,
                             title="Symlink Escape Blocked",
                             detail=(
-                                f"Symlink component '{norm_part}' resolves to '{resolved_link}', "
-                                f"which escapes workspace root '{self._root}'."
+                                f"Symlink component '{norm_part}' in '{clean_input}' resolves outside "
+                                "the workspace sandbox root."
                             ),
                             is_security_violation=True,
-                            context={"requested_path": clean_input, "resolved_target": str(resolved_link)},
+                            context={"requested_path": clean_input, "symlink_component": norm_part},
                         )
                     )
             current = next_candidate
@@ -156,9 +173,9 @@ class PosixJailFileSystem:
                 DomainError(
                     code=ErrorCode.ERR_JAIL_ESCAPE,
                     title="Sandbox Boundary Violation",
-                    detail=f"Resolved path '{canonical_target}' escapes workspace root '{self._root}'.",
+                    detail=f"Resolved path for '{clean_input}' escapes the workspace sandbox root.",
                     is_security_violation=True,
-                    context={"requested_path": clean_input, "resolved_path": str(canonical_target)},
+                    context={"requested_path": clean_input},
                 )
             )
 
@@ -265,6 +282,19 @@ class PosixJailFileSystem:
                         context={"path": rel_posix, "mode": oct(st.st_mode)},
                     )
                 )
+            if st.st_nlink > 1 and not self._policy.allow_symlinks_within_jail:
+                return Err(
+                    DomainError(
+                        code=ErrorCode.ERR_SPECIAL_FILE_BLOCKED,
+                        title="Hardlinked File Blocked",
+                        detail=(
+                            f"Path '{rel_posix}' has multiple hardlinks (st_nlink={st.st_nlink}), "
+                            "which is forbidden to prevent hardlink jail escapes."
+                        ),
+                        is_security_violation=True,
+                        context={"path": rel_posix, "nlink": st.st_nlink},
+                    )
+                )
             if st.st_size > max_size:
                 return Err(
                     DomainError(
@@ -299,6 +329,117 @@ class PosixJailFileSystem:
         finally:
             os.close(fd)
 
+    def _stream_large_text_file(
+        self,
+        target_path: Path,
+        rel_posix: str,
+        *,
+        start_line: int,
+        end_line: int | None,
+        byte_limit: int,
+    ) -> Result[FileReadResult, DomainError]:
+        """Stream a large regular file in O(1) 64KB chunks without loading the entire file into RAM."""
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(target_path), flags)
+        except OSError as exc:
+            return Err(
+                DomainError(
+                    code=ErrorCode.ERR_VALIDATION_FAILED,
+                    title="File Open Error",
+                    detail=f"Unable to open '{rel_posix}': {exc.strerror}",
+                )
+            )
+
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return Err(
+                    DomainError(
+                        code=ErrorCode.ERR_SPECIAL_FILE_BLOCKED,
+                        title="Special Device or FIFO Blocked",
+                        detail=f"Path '{rel_posix}' is not a regular file.",
+                        is_security_violation=True,
+                    )
+                )
+
+            hasher = hashlib.sha256()
+            selected_lines: list[str] = []
+            collected_bytes = 0
+            truncated = False
+            current_line_no = 0
+            remainder = b""
+            first_chunk = True
+
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                if first_chunk:
+                    first_chunk = False
+                    if b"\x00" in chunk[:8192]:
+                        return Err(
+                            DomainError(
+                                code=ErrorCode.ERR_BINARY_FILE,
+                                title="Binary File Rejected",
+                                detail=f"File '{rel_posix}' appears to be a binary file.",
+                            )
+                        )
+                hasher.update(chunk)
+                buf = remainder + chunk
+                lines = buf.split(b"\n")
+                remainder = lines.pop()
+
+                for raw_line in lines:
+                    current_line_no += 1
+                    if current_line_no < start_line:
+                        continue
+                    if end_line is not None and current_line_no > end_line:
+                        continue
+                    if not truncated:
+                        line_str = raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
+                        line_bytes = len(line_str.encode("utf-8")) + 1
+                        if collected_bytes + line_bytes > byte_limit:
+                            truncated = True
+                        else:
+                            selected_lines.append(line_str)
+                            collected_bytes += line_bytes
+
+            if remainder:
+                current_line_no += 1
+                if (
+                    current_line_no >= start_line
+                    and (end_line is None or current_line_no <= end_line)
+                    and not truncated
+                ):
+                    line_str = remainder.rstrip(b"\r").decode("utf-8", errors="replace")
+                    if collected_bytes + len(line_str.encode("utf-8")) <= byte_limit:
+                        selected_lines.append(line_str)
+                    else:
+                        truncated = True
+
+            joined = "\n".join(selected_lines)
+            if truncated:
+                joined += f"\n... [AEGIS SANDBOX: Output truncated at {byte_limit} bytes limit] ..."
+            scrubbed_text, redaction_count = SecretRedactor.redact_text(joined)
+            actual_end = start_line - 1 + len(selected_lines) if selected_lines else start_line
+
+            return Ok(
+                FileReadResult(
+                    relative_path=rel_posix,
+                    content=scrubbed_text,
+                    sha256=hasher.hexdigest(),
+                    total_bytes=st.st_size,
+                    start_line=start_line,
+                    end_line=actual_end,
+                    total_lines=current_line_no,
+                    truncated=truncated,
+                    secrets_redacted=redaction_count,
+                )
+            )
+        finally:
+            os.close(fd)
+
     def read_text_file(
         self,
         rel_path: str,
@@ -313,7 +454,21 @@ class PosixJailFileSystem:
 
         target_path = path_res.unwrap()
         rel_posix = self._to_rel_posix(target_path)
+        byte_limit = max_bytes if max_bytes is not None else self._policy.max_read_bytes
         hard_cap = max(self._policy.max_write_bytes, self._policy.max_read_bytes * 4)
+
+        try:
+            st = os.lstat(target_path)
+            if stat.S_ISREG(st.st_mode) and st.st_size > hard_cap and st.st_size <= 104_857_600:
+                return self._stream_large_text_file(
+                    target_path,
+                    rel_posix,
+                    start_line=start_line,
+                    end_line=end_line,
+                    byte_limit=byte_limit,
+                )
+        except OSError:
+            pass
 
         raw_res = self._read_regular_file_bytes(target_path, rel_posix, max_size=hard_cap)
         if raw_res.is_err:
@@ -455,6 +610,7 @@ class PosixJailFileSystem:
 
         existed = os.path.lexists(target_path)
         previous_sha256: str | None = None
+        existing_raw_bytes: bytes = b""
 
         if existed:
             existing_res = self._read_regular_file_bytes(
@@ -462,7 +618,8 @@ class PosixJailFileSystem:
             )
             if existing_res.is_err:
                 return Err(existing_res.unwrap_err())
-            previous_sha256 = hashlib.sha256(existing_res.unwrap()).hexdigest()
+            existing_raw_bytes = existing_res.unwrap()
+            previous_sha256 = hashlib.sha256(existing_raw_bytes).hexdigest()
 
         if expected_sha256 is not None:
             norm_expected = expected_sha256.strip().lower()
@@ -482,6 +639,21 @@ class PosixJailFileSystem:
                         },
                     )
                 )
+
+        redacted_marker = SecretRedactor.find_redacted_placeholder(content)
+        if redacted_marker is not None and redacted_marker.encode("utf-8") not in existing_raw_bytes:
+            return Err(
+                DomainError(
+                    code=ErrorCode.ERR_REDACTED_CONTENT_WRITE_BLOCKED,
+                    title="Redacted Secret Placeholder Write Blocked",
+                    detail=(
+                        f"Content for '{rel_posix}' contains redaction placeholder '{redacted_marker}' "
+                        "that was not present in the original file. Writing it back would overwrite "
+                        "and destroy the real secret value. Use fs_patch_file on non-secret lines instead."
+                    ),
+                    context={"path": rel_posix, "placeholder": redacted_marker},
+                )
+            )
 
         new_bytes = content.encode("utf-8")
         new_sha256 = hashlib.sha256(new_bytes).hexdigest()
@@ -551,6 +723,20 @@ class PosixJailFileSystem:
                     code=ErrorCode.ERR_BINARY_FILE,
                     title="Non-UTF8 File Rejected",
                     detail=f"File '{rel_posix}' cannot be patched as UTF-8 text.",
+                )
+            )
+
+        redacted_marker = SecretRedactor.find_redacted_placeholder(replacement)
+        if redacted_marker is not None and redacted_marker not in text:
+            return Err(
+                DomainError(
+                    code=ErrorCode.ERR_REDACTED_CONTENT_WRITE_BLOCKED,
+                    title="Redacted Secret Placeholder Patch Blocked",
+                    detail=(
+                        f"Patch replacement for '{rel_posix}' contains redaction placeholder "
+                        f"'{redacted_marker}', which would destroy the original secret."
+                    ),
+                    context={"path": rel_posix, "placeholder": redacted_marker},
                 )
             )
 
@@ -719,21 +905,24 @@ class PosixJailFileSystem:
 
         start_node = path_res.unwrap()
 
-        compiled_re: re.Pattern[str] | None = None
+        compiled_re: Any = None
         if is_regex:
             if _REDOS_HAZARD_RE.search(query):
                 return Err(
                     DomainError(
                         code=ErrorCode.ERR_INVALID_REGEX,
                         title="Catastrophic Backtracking Regex Blocked (ReDoS Guard)",
-                        detail="Regular expression contains nested quantifiers that pose a ReDoS risk.",
+                        detail="Regular expression contains nested or chained quantifiers that pose a ReDoS risk.",
                         is_security_violation=True,
                         context={"query": query},
                     )
                 )
             try:
-                compiled_re = re.compile(query)
-            except re.error as exc:
+                if _re2_engine is not None:
+                    compiled_re = _re2_engine.compile(query)
+                else:
+                    compiled_re = re.compile(query)
+            except Exception as exc:
                 return Err(
                     DomainError(
                         code=ErrorCode.ERR_INVALID_REGEX,

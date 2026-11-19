@@ -38,6 +38,11 @@ def test_command_guard_allows_safe_allowlisted_commands(tmp_path: Path) -> None:
         ("git", ["remote", "add", "evil", "https://example.com"], ErrorCode.ERR_DANGEROUS_ARGUMENTS),
         ("git", ["config", "--global", "user.name", "x"], ErrorCode.ERR_DANGEROUS_ARGUMENTS),
         ("git", ["-c", "core.sshCommand=sh", "status"], ErrorCode.ERR_DANGEROUS_ARGUMENTS),
+        ("git", ["diff", "--no-index", "a.txt", "b.txt"], ErrorCode.ERR_DANGEROUS_ARGUMENTS),
+        ("head", ["../outside.txt"], ErrorCode.ERR_JAIL_ESCAPE),
+        ("head", ["~/secrets.txt"], ErrorCode.ERR_JAIL_ESCAPE),
+        ("head", ["/etc/passwd"], ErrorCode.ERR_JAIL_ESCAPE),
+        ("head", [".env"], ErrorCode.ERR_SENSITIVE_PATH_BLOCKED),
     ],
 )
 def test_command_guard_blocks_unlisted_binaries_and_dangerous_git_args(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import sys
+import threading
 from typing import TextIO
 
 from aegis_mcp.domain.policy import SandboxPolicy
@@ -44,7 +46,12 @@ class StdioMCPServer:
             telemetry=self._telemetry,
             logger=self._logger,
         )
-        self._dispatcher = MCPDispatcher(registry=self._registry, logger=self._logger)
+        self._dispatcher = MCPDispatcher(
+            registry=self._registry,
+            logger=self._logger,
+            on_cancel=self._runner.cancel_request,
+        )
+        self._write_lock = threading.Lock()
 
     @property
     def dispatcher(self) -> MCPDispatcher:
@@ -54,8 +61,18 @@ class StdioMCPServer:
     def telemetry(self) -> InMemoryTelemetry:
         return self._telemetry
 
+    def _write_frame(self, protocol_out: TextIO, response_str: str) -> None:
+        with self._write_lock:
+            protocol_out.write(response_str + "\n")
+            protocol_out.flush()
+
     def serve_forever(self) -> None:
-        """Read newline-delimited JSON-RPC requests from in_stream until EOF."""
+        """Read newline-delimited JSON-RPC requests from in_stream with concurrent worker dispatch."""
+        protocol_out = self._out
+        original_stdout = sys.stdout
+        if protocol_out is sys.stdout:
+            sys.stdout = sys.stderr
+
         self._logger.info(
             "SERVER_STARTED",
             "aegis-mcp stdio server listening",
@@ -66,14 +83,37 @@ class StdioMCPServer:
             },
             is_audit_event=True,
         )
-        try:
-            for line in self._in:
-                response_str = self._dispatcher.handle_raw_line(line)
-                if response_str is not None:
-                    self._out.write(response_str + "\n")
-                    self._out.flush()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self._logger.info("SERVER_STOPPED", "aegis-mcp stdio server shut down cleanly")
+        futures: list[concurrent.futures.Future[None]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="aegis-worker") as pool:
+            try:
+                for line in self._in:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    # Fast-path synchronous handling on main reader thread for initialize and notifications
+                    # so notifications/cancelled can preempt in-flight worker threads immediately.
+                    if (
+                        '"notifications/cancelled"' in stripped
+                        or '"notifications/initialized"' in stripped
+                        or '"initialize"' in stripped
+                        or '"ping"' in stripped
+                    ):
+                        resp = self._dispatcher.handle_raw_line(stripped)
+                        if resp is not None:
+                            self._write_frame(protocol_out, resp)
+                    else:
+                        def _run_line(raw_line: str) -> None:
+                            r = self._dispatcher.handle_raw_line(raw_line)
+                            if r is not None:
+                                self._write_frame(protocol_out, r)
+
+                        futures.append(pool.submit(_run_line, stripped))
+                for fut in futures:
+                    fut.result()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                if protocol_out is original_stdout:
+                    sys.stdout = original_stdout
+                self._logger.info("SERVER_STOPPED", "aegis-mcp stdio server shut down cleanly")
 
