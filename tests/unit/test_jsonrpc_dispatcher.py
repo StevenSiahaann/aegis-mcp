@@ -62,6 +62,9 @@ def test_jsonrpc_initialize_and_tools_list(tmp_path: Path) -> None:
 def test_jsonrpc_protocol_error_codes_vs_domain_is_error(tmp_path: Path) -> None:
     # 1. ARRANGE
     server = _make_server(tmp_path)
+    server.dispatcher.handle_raw_line(
+        json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+    )
 
     # 2. ACT
     parse_err_raw = server.dispatcher.handle_raw_line("{not_valid_json")

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import unicodedata
+from pathlib import Path
 from typing import Any
 
 from aegis_mcp.domain.errors import DomainError, ErrorCode
@@ -29,6 +31,7 @@ _SAFE_ENV_TEMPLATES: frozenset[str] = frozenset(
 _SENSITIVE_EXACT_NAMES: frozenset[str] = frozenset(
     {
         ".env",
+        ".envrc",
         ".npmrc",
         ".pypirc",
         ".netrc",
@@ -57,10 +60,12 @@ _SENSITIVE_SUFFIXES: tuple[str, ...] = (
     ".tfstate.backup",
     ".tfvars",
     ".kdbx",
+    ".ovpn",
 )
 
 _SENSITIVE_GLOBS: tuple[str, ...] = (
     ".env.*",
+    ".envrc.*",
     "id_rsa*",
     "id_ed25519*",
     "id_ecdsa*",
@@ -73,9 +78,13 @@ _SENSITIVE_GLOBS: tuple[str, ...] = (
 _SENSITIVE_REL_PATH_PATTERNS: tuple[str, ...] = (
     ".git/config",
     ".git/credentials",
+    ".git/hooks",
+    ".git/hooks/*",
     ".git-credentials",
     ".aws/credentials",
     ".aws/config",
+    ".docker/config.json",
+    ".kube/config",
     ".ssh/*",
     ".gnupg/*",
 )
@@ -174,8 +183,19 @@ _INLINE_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+_REDACTED_MARKER_RE = re.compile(
+    r"\[REDACTED_(?:SECRET|AWS_KEY|GITHUB_TOKEN|API_KEY|GOOGLE_API_KEY|SLACK_TOKEN|AUTH_TOKEN|PEM_PRIVATE_KEY)\]"
+)
+
+
 class SecretRedactor:
     """Scrubs Tier-3/Tier-4 secrets from text outputs and structured log dictionaries."""
+
+    @staticmethod
+    def find_redacted_placeholder(text: str) -> str | None:
+        """Return the first [REDACTED_*] placeholder found in text, or None."""
+        match = _REDACTED_MARKER_RE.search(text)
+        return match.group(0) if match else None
 
     @staticmethod
     def redact_text(text: str) -> tuple[str, int]:
@@ -222,7 +242,11 @@ _FORBIDDEN_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
         "daemon",
         "instaweb",
         "filter-branch",
-        " gc",
+        "gc",
+        "archive",
+        "bundle",
+        "submodule",
+        "worktree",
     }
 )
 
@@ -232,16 +256,90 @@ _FORBIDDEN_GIT_FLAGS: tuple[str, ...] = (
     "--upload-pack",
     "--receive-pack",
     "--exec",
+    "--no-index",
+    "--git-dir",
+    "--work-tree",
+    "--output",
     "core.sshcommand",
     "core.fsmonitor",
     "core.editor",
+    "core.hooksPath",
     "alias.",
     "--force",
 )
 
+_FORBIDDEN_GIT_EXACT_FLAGS: frozenset[str] = frozenset({"-c", "-C", "-f"})
+
 
 class CommandArgumentGuard:
-    """Validates binary allowlist and prevents dangerous subcommands or flag injections."""
+    """Validates binary allowlist and prevents dangerous subcommands, flag injections, or path escapes."""
+
+    @staticmethod
+    def _check_arg_path_safety(arg: str, policy: SandboxPolicy) -> DomainError | None:
+        """Ensure command arguments cannot reference paths outside the workspace jail or sensitive files."""
+        candidates = [arg]
+        if "=" in arg and arg.startswith("-"):
+            _, val = arg.split("=", 1)
+            if val:
+                candidates.append(val)
+
+        for token in candidates:
+            clean = token.strip()
+            if not clean:
+                continue
+            if clean.startswith("~"):
+                return DomainError(
+                    code=ErrorCode.ERR_JAIL_ESCAPE,
+                    title="Home Directory Expansion Blocked In Command Argument",
+                    detail=f"Argument '{arg}' references '~' outside the workspace sandbox.",
+                    is_security_violation=True,
+                )
+            norm_parts = clean.replace("\\", "/").split("/")
+            if ".." in norm_parts:
+                return DomainError(
+                    code=ErrorCode.ERR_JAIL_ESCAPE,
+                    title="Parent Traversal Blocked In Command Argument",
+                    detail=f"Argument '{arg}' contains '..' path traversal.",
+                    is_security_violation=True,
+                )
+            if clean.startswith("/"):
+                resolved = Path(os.path.realpath(clean))
+                if not resolved.is_relative_to(policy.workspace_root):
+                    return DomainError(
+                        code=ErrorCode.ERR_JAIL_ESCAPE,
+                        title="Outside-Workspace Path Blocked In Command Argument",
+                        detail=f"Argument '{arg}' references an absolute path outside the workspace sandbox.",
+                        is_security_violation=True,
+                    )
+                rel_posix = resolved.relative_to(policy.workspace_root).as_posix()
+                is_sens, reason = SensitiveFileMatcher.is_sensitive(rel_posix)
+                if is_sens:
+                    return DomainError(
+                        code=ErrorCode.ERR_SENSITIVE_PATH_BLOCKED,
+                        title="Sensitive File Blocked In Command Argument",
+                        detail=f"Argument '{arg}' targets a protected file: {reason}.",
+                        is_security_violation=True,
+                    )
+            elif not clean.startswith("-"):
+                is_sens, reason = SensitiveFileMatcher.is_sensitive(clean)
+                if is_sens:
+                    return DomainError(
+                        code=ErrorCode.ERR_SENSITIVE_PATH_BLOCKED,
+                        title="Sensitive File Blocked In Command Argument",
+                        detail=f"Argument '{arg}' targets a protected file: {reason}.",
+                        is_security_violation=True,
+                    )
+                candidate_path = policy.workspace_root / clean
+                if os.path.lexists(candidate_path):
+                    resolved = Path(os.path.realpath(candidate_path))
+                    if not resolved.is_relative_to(policy.workspace_root):
+                        return DomainError(
+                            code=ErrorCode.ERR_JAIL_ESCAPE,
+                            title="Symlink Escape Blocked In Command Argument",
+                            detail=f"Argument '{arg}' resolves outside the workspace sandbox.",
+                            is_security_violation=True,
+                        )
+        return None
 
     @staticmethod
     def validate(
@@ -298,14 +396,28 @@ class CommandArgumentGuard:
                         is_security_violation=True,
                     )
                 )
-            normalized_args.append(normalize_nfc(arg))
+            norm_arg = normalize_nfc(arg)
+            path_err = CommandArgumentGuard._check_arg_path_safety(norm_arg, policy)
+            if path_err is not None:
+                return Err(path_err)
+            normalized_args.append(norm_arg)
 
         # Git-specific guardrails
         if clean_bin == "git":
             for arg in normalized_args:
+                if arg in _FORBIDDEN_GIT_EXACT_FLAGS:
+                    return Err(
+                        DomainError(
+                            code=ErrorCode.ERR_DANGEROUS_ARGUMENTS,
+                            title="Restricted Git Flag Blocked",
+                            detail=f"Git flag '{arg}' is forbidden inside the sandbox.",
+                            is_security_violation=True,
+                            context={"binary": clean_bin, "blocked_argument": arg},
+                        )
+                    )
                 lower_arg = arg.lower()
                 for bad_flag in _FORBIDDEN_GIT_FLAGS:
-                    if bad_flag in lower_arg:
+                    if bad_flag.lower() in lower_arg:
                         return Err(
                             DomainError(
                                 code=ErrorCode.ERR_DANGEROUS_ARGUMENTS,

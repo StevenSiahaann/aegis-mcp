@@ -5,8 +5,12 @@ from __future__ import annotations
 import contextlib
 import math
 import resource
+import sys
 from collections.abc import Callable
 from pathlib import Path
+
+from aegis_mcp.domain.policy import SandboxPolicy
+from aegis_mcp.infrastructure.os_sandbox.kernel_sandbox import SeatbeltDriver
 
 
 def make_preexec_limiter(
@@ -14,16 +18,18 @@ def make_preexec_limiter(
     cpu_seconds: int,
     fsize_bytes: int,
     nofile: int,
+    as_bytes: int = 536_870_912,
 ) -> Callable[[], None]:
     """Create a minimal, async-signal-safe preexec_fn callback for POSIX subprocesses.
 
     Handles macOS Darwin XNU kernel differences gracefully (where RLIMIT_AS/RLIMIT_NPROC
     behave differently from Linux) while enforcing deterministic RLIMIT_CPU, RLIMIT_FSIZE,
-    RLIMIT_CORE, and RLIMIT_NOFILE bounds.
+    RLIMIT_CORE, RLIMIT_NOFILE, and Linux RLIMIT_AS bounds.
     """
     safe_cpu = max(1, int(math.ceil(cpu_seconds)))
     safe_fsize = max(4096, int(fsize_bytes))
     safe_nofile = max(16, int(nofile))
+    safe_as = max(33_554_432, int(as_bytes))
 
     def _apply_limits() -> None:
         # 1. Disable core dumps to prevent sensitive memory from being written to disk
@@ -49,22 +55,18 @@ def make_preexec_limiter(
             target_nofile = safe_nofile if hard_nofile == resource.RLIM_INFINITY else min(safe_nofile, hard_nofile)
             resource.setrlimit(resource.RLIMIT_NOFILE, (target_nofile, target_nofile))
 
+        # 5. Enforce virtual memory address space cap on Linux kernels
+        if sys.platform.startswith("linux") and hasattr(resource, "RLIMIT_AS"):
+            with contextlib.suppress(ValueError, OSError):
+                _, hard_as = resource.getrlimit(resource.RLIMIT_AS)
+                target_as = safe_as if hard_as == resource.RLIM_INFINITY else min(safe_as, hard_as)
+                resource.setrlimit(resource.RLIMIT_AS, (target_as, target_as))
+
     return _apply_limits
 
 
 def build_macos_seatbelt_profile(workspace_root: Path, allow_write: bool) -> str:
-    """Generate a macOS sandbox-exec SBPL profile denying network and restricting file writes."""
-    escaped_root = str(workspace_root).replace("\\", "\\\\").replace('"', '\\"')
-    write_rule = (
-        f'(allow file-write* (subpath "{escaped_root}"))'
-        if allow_write
-        else f'(allow file-write* (subpath "{escaped_root}/.aegis-sandbox"))'
-    )
-    return (
-        "(version 1)\n"
-        "(allow default)\n"
-        "(deny network*)\n"
-        "(deny file-write*)\n"
-        '(allow file-write* (literal "/dev/null") (literal "/dev/zero"))\n'
-        f"{write_rule}\n"
-    )
+    """Generate a deny-by-default macOS sandbox-exec SBPL profile."""
+    policy = SandboxPolicy(workspace_root=workspace_root, allow_write=allow_write)
+    driver = SeatbeltDriver(policy=policy, binary="/usr/bin/sandbox-exec")
+    return driver.build_profile()

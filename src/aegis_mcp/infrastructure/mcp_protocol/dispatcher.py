@@ -14,6 +14,7 @@ from aegis_mcp.infrastructure.mcp_protocol.models import (
     JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
+    JSONRPC_SERVER_NOT_INITIALIZED,
     SUPPORTED_MCP_VERSIONS,
 )
 from aegis_mcp.infrastructure.mcp_protocol.registry import ToolRegistry
@@ -209,6 +210,14 @@ class MCPDispatcher:
 
         if method == "ping":
             return self._make_result_response(req_id, {})
+
+        if not self._initialized:
+            return self._make_error_response(
+                req_id,
+                JSONRPC_SERVER_NOT_INITIALIZED,
+                "Server not initialized: client must send 'initialize' before invoking MCP methods",
+                data={"trace_id": trace_id},
+            )
 
         if method == "tools/list":
             return self._make_result_response(

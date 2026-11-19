@@ -60,6 +60,16 @@ def run_simulation() -> None:
             max_timeout_seconds=2.0,
         )
         server = StdioMCPServer(policy=policy, err_stream=err_log)
+        server.dispatcher.handle_raw_line(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26"},
+                }
+            )
+        )
 
         scenarios: list[tuple[str, str, dict[str, Any]]] = [
             (

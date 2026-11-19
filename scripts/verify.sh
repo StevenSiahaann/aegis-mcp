@@ -103,7 +103,7 @@ fi
 
 # GATE 5: AUTOMATED TEST SUITE & COVERAGE GATE
 echo -e "\n${YELLOW}[Gate 5/5] Executing Pytest suite (Unit + Integration + Property + E2E)...${NC}"
-if "$PY_BIN" -m pytest --cov=aegis_mcp --cov-report=term-missing --cov-fail-under=88; then
+if "$PY_BIN" -m pytest --cov=aegis_mcp --cov-branch --cov-report=term-missing --cov-fail-under=86; then
     echo -e "${GREEN}[PASS] All automated tests and coverage thresholds passed.${NC}"
 else
     echo -e "${RED}[FAIL] Automated test suite or coverage threshold failed!${NC}"

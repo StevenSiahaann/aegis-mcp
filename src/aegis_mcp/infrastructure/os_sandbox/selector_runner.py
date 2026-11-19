@@ -19,11 +19,9 @@ from aegis_mcp.domain.policy import SandboxPolicy
 from aegis_mcp.domain.result import Err, Ok, Result
 from aegis_mcp.domain.uuidv7 import generate_uuidv7
 from aegis_mcp.infrastructure.os_sandbox.env_builder import CleanEnvironmentBuilder
+from aegis_mcp.infrastructure.os_sandbox.kernel_sandbox import select_kernel_sandbox
 from aegis_mcp.infrastructure.os_sandbox.posix_fs import PosixJailFileSystem
-from aegis_mcp.infrastructure.os_sandbox.rlimits import (
-    build_macos_seatbelt_profile,
-    make_preexec_limiter,
-)
+from aegis_mcp.infrastructure.os_sandbox.rlimits import make_preexec_limiter
 
 
 class SelectorSandboxRunner:
@@ -54,20 +52,30 @@ class SelectorSandboxRunner:
         clean_env = CleanEnvironmentBuilder.build(self._policy)
 
         effective_argv = list(argv)
-        if self._policy.enable_seatbelt and sys.platform == "darwin":
-            sb_bin = shutil.which("sandbox-exec")
-            if sb_bin:
-                profile = build_macos_seatbelt_profile(
-                    self._policy.workspace_root,
-                    allow_write=self._policy.allow_write,
-                )
-                effective_argv = [sb_bin, "-p", profile, *effective_argv]
+        if self._policy.enable_seatbelt or self._policy.require_kernel_sandbox:
+            kernel_driver = select_kernel_sandbox(self._policy)
+            if kernel_driver is None:
+                if self._policy.require_kernel_sandbox:
+                    return Err(
+                        DomainError(
+                            code=ErrorCode.ERR_KERNEL_SANDBOX_UNAVAILABLE,
+                            title="Kernel Sandbox Driver Unavailable (Fail-Closed)",
+                            detail=(
+                                "No OS kernel sandbox backend (macOS sandbox-exec or Linux bubblewrap) "
+                                "is available on this host, and require_kernel_sandbox is enabled."
+                            ),
+                            is_security_violation=True,
+                        )
+                    )
+            else:
+                effective_argv = kernel_driver.wrap(effective_argv, cwd=cwd)
 
         cpu_limit = max(int(timeout_seconds) + 2, self._policy.rlimit_cpu_seconds)
         preexec = make_preexec_limiter(
             cpu_seconds=cpu_limit,
             fsize_bytes=self._policy.rlimit_fsize_bytes,
             nofile=self._policy.rlimit_nofile,
+            as_bytes=self._policy.rlimit_as_bytes,
         )
 
         start_ns = time.perf_counter_ns()

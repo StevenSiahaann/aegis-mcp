@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -43,6 +44,23 @@ from aegis_mcp.infrastructure.mcp_protocol.models import (
 from aegis_mcp.infrastructure.observability.context import get_current_trace_context
 from aegis_mcp.infrastructure.observability.logger import NDJSONLogger
 
+_BULK_PAYLOAD_KEYS: frozenset[str] = frozenset({"content", "code", "target", "replacement"})
+
+
+def _summarize_audit_arguments(args_dict: dict[str, Any]) -> dict[str, Any]:
+    """Replace large or potentially sensitive payload fields with compact size + SHA-256 metadata."""
+    summary: dict[str, Any] = {}
+    for k, v in args_dict.items():
+        if k in _BULK_PAYLOAD_KEYS and isinstance(v, str):
+            raw = v.encode("utf-8")
+            summary[k] = {
+                "bytes": len(raw),
+                "sha256_prefix": hashlib.sha256(raw).hexdigest()[:16],
+            }
+        else:
+            summary[k] = v
+    return summary
+
 
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
@@ -52,13 +70,17 @@ class ToolDefinition:
     description: str
     args_model: type[BaseModel]
     invoker: Callable[[BaseModel], Result[Any, DomainError]]
+    annotations: dict[str, bool] = field(default_factory=dict)
 
     def to_mcp_descriptor(self) -> dict[str, Any]:
-        return {
+        desc: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "inputSchema": pydantic_to_mcp_input_schema(self.args_model),
         }
+        if self.annotations:
+            desc["annotations"] = dict(self.annotations)
+        return desc
 
 
 class ToolRegistry:
@@ -102,6 +124,7 @@ class ToolRegistry:
                 ),
                 args_model=FsReadFileArgs,
                 invoker=self._invoke_read_file,
+                annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="fs_list_directory",
@@ -111,6 +134,7 @@ class ToolRegistry:
                 ),
                 args_model=FsListDirectoryArgs,
                 invoker=self._invoke_list_directory,
+                annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="fs_search_text",
@@ -120,6 +144,7 @@ class ToolRegistry:
                 ),
                 args_model=FsSearchTextArgs,
                 invoker=self._invoke_search_text,
+                annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="fs_write_file",
@@ -129,6 +154,7 @@ class ToolRegistry:
                 ),
                 args_model=FsWriteFileArgs,
                 invoker=self._invoke_write_file,
+                annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="fs_patch_file",
@@ -138,6 +164,7 @@ class ToolRegistry:
                 ),
                 args_model=FsPatchFileArgs,
                 invoker=self._invoke_patch_file,
+                annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="exec_python",
@@ -147,6 +174,7 @@ class ToolRegistry:
                 ),
                 args_model=ExecPythonArgs,
                 invoker=self._invoke_exec_python,
+                annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="exec_command",
@@ -156,6 +184,7 @@ class ToolRegistry:
                 ),
                 args_model=ExecCommandArgs,
                 invoker=self._invoke_exec_command,
+                annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
             ),
             ToolDefinition(
                 name="sandbox_inspect_policy",
@@ -165,6 +194,7 @@ class ToolRegistry:
                 ),
                 args_model=SandboxInspectPolicyArgs,
                 invoker=self._invoke_inspect_policy,
+                annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
             ),
         ]
         for d in defs:
@@ -268,7 +298,7 @@ class ToolRegistry:
             self._logger.warn(
                 "TOOL_VALIDATION_FAILED",
                 f"Argument validation failed for tool '{name}'",
-                context={"tool": name, "arguments": args_dict},
+                context={"tool": name, "arguments": _summarize_audit_arguments(args_dict)},
                 duration_ms=duration_ms,
             )
             return {
@@ -300,7 +330,7 @@ class ToolRegistry:
                     "tool": name,
                     "error_code": err.code.value,
                     "is_security_violation": err.is_security_violation,
-                    "arguments": args_dict,
+                    "arguments": _summarize_audit_arguments(args_dict),
                 },
                 duration_ms=duration_ms,
                 is_audit_event=True,
@@ -326,7 +356,7 @@ class ToolRegistry:
         self._logger.info(
             "TOOL_EXECUTED",
             f"Tool '{name}' completed successfully",
-            context={"tool": name, "arguments": args_dict},
+            context={"tool": name, "arguments": _summarize_audit_arguments(args_dict)},
             duration_ms=duration_ms,
             is_audit_event=is_mutating_or_exec,
         )

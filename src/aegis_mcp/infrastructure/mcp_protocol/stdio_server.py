@@ -56,6 +56,11 @@ class StdioMCPServer:
 
     def serve_forever(self) -> None:
         """Read newline-delimited JSON-RPC requests from in_stream until EOF."""
+        protocol_out = self._out
+        original_stdout = sys.stdout
+        if protocol_out is sys.stdout:
+            sys.stdout = sys.stderr
+
         self._logger.info(
             "SERVER_STARTED",
             "aegis-mcp stdio server listening",
@@ -70,10 +75,12 @@ class StdioMCPServer:
             for line in self._in:
                 response_str = self._dispatcher.handle_raw_line(line)
                 if response_str is not None:
-                    self._out.write(response_str + "\n")
-                    self._out.flush()
+                    protocol_out.write(response_str + "\n")
+                    protocol_out.flush()
         except KeyboardInterrupt:
             pass
         finally:
+            if protocol_out is original_stdout:
+                sys.stdout = original_stdout
             self._logger.info("SERVER_STOPPED", "aegis-mcp stdio server shut down cleanly")
 

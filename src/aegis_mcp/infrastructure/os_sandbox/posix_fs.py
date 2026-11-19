@@ -41,8 +41,17 @@ _SKIP_SEARCH_DIRS: frozenset[str] = frozenset(
     }
 )
 
-# Heuristic detector for catastrophic backtracking regexes (nested quantifiers)
-_REDOS_HAZARD_RE = re.compile(r"\([^()]*[+*][^()]*\)[+*?{]")
+# Heuristic detector for catastrophic backtracking regexes:
+# 1. Quantified group with inner quantifiers: (a+)+, (a*)*, ([a-z]+){2,}
+# 2. Quantified group with alternation: (a|aa)+, (foo|foobar)*
+# 3. Quantified nested groups: ((a)+)+
+# 4. Backreferences: \1 .. \9
+_REDOS_HAZARD_RE = re.compile(
+    r"(?:\([^()]*[+*?{][^()]*\)\s*[+*?{])"
+    r"|(?:\([^()]*\|[^()]*\)\s*[+*?{])"
+    r"|(?:\((?:[^()]*\([^()]*\))+[^()]*\)\s*[+*?{])"
+    r"|(?:\\[1-9])"
+)
 
 
 class PosixJailFileSystem:
@@ -93,9 +102,9 @@ class PosixJailFileSystem:
                     DomainError(
                         code=ErrorCode.ERR_JAIL_ESCAPE,
                         title="Sandbox Boundary Violation",
-                        detail=f"Absolute path '{clean_input}' escapes workspace root '{self._root}'.",
+                        detail="Requested absolute path escapes the workspace sandbox root.",
                         is_security_violation=True,
-                        context={"requested_path": clean_input},
+                        context={"requested_path": "<outside_workspace>"},
                     )
                 )
 
@@ -141,11 +150,11 @@ class PosixJailFileSystem:
                             code=ErrorCode.ERR_JAIL_ESCAPE,
                             title="Symlink Escape Blocked",
                             detail=(
-                                f"Symlink component '{norm_part}' resolves to '{resolved_link}', "
-                                f"which escapes workspace root '{self._root}'."
+                                f"Symlink component '{norm_part}' in '{clean_input}' resolves outside "
+                                "the workspace sandbox root."
                             ),
                             is_security_violation=True,
-                            context={"requested_path": clean_input, "resolved_target": str(resolved_link)},
+                            context={"requested_path": clean_input, "symlink_component": norm_part},
                         )
                     )
             current = next_candidate
@@ -156,9 +165,9 @@ class PosixJailFileSystem:
                 DomainError(
                     code=ErrorCode.ERR_JAIL_ESCAPE,
                     title="Sandbox Boundary Violation",
-                    detail=f"Resolved path '{canonical_target}' escapes workspace root '{self._root}'.",
+                    detail=f"Resolved path for '{clean_input}' escapes the workspace sandbox root.",
                     is_security_violation=True,
-                    context={"requested_path": clean_input, "resolved_path": str(canonical_target)},
+                    context={"requested_path": clean_input},
                 )
             )
 
@@ -263,6 +272,19 @@ class PosixJailFileSystem:
                         ),
                         is_security_violation=True,
                         context={"path": rel_posix, "mode": oct(st.st_mode)},
+                    )
+                )
+            if st.st_nlink > 1 and not self._policy.allow_symlinks_within_jail:
+                return Err(
+                    DomainError(
+                        code=ErrorCode.ERR_SPECIAL_FILE_BLOCKED,
+                        title="Hardlinked File Blocked",
+                        detail=(
+                            f"Path '{rel_posix}' has multiple hardlinks (st_nlink={st.st_nlink}), "
+                            "which is forbidden to prevent hardlink jail escapes."
+                        ),
+                        is_security_violation=True,
+                        context={"path": rel_posix, "nlink": st.st_nlink},
                     )
                 )
             if st.st_size > max_size:
@@ -455,6 +477,7 @@ class PosixJailFileSystem:
 
         existed = os.path.lexists(target_path)
         previous_sha256: str | None = None
+        existing_raw_bytes: bytes = b""
 
         if existed:
             existing_res = self._read_regular_file_bytes(
@@ -462,7 +485,8 @@ class PosixJailFileSystem:
             )
             if existing_res.is_err:
                 return Err(existing_res.unwrap_err())
-            previous_sha256 = hashlib.sha256(existing_res.unwrap()).hexdigest()
+            existing_raw_bytes = existing_res.unwrap()
+            previous_sha256 = hashlib.sha256(existing_raw_bytes).hexdigest()
 
         if expected_sha256 is not None:
             norm_expected = expected_sha256.strip().lower()
@@ -482,6 +506,21 @@ class PosixJailFileSystem:
                         },
                     )
                 )
+
+        redacted_marker = SecretRedactor.find_redacted_placeholder(content)
+        if redacted_marker is not None and redacted_marker.encode("utf-8") not in existing_raw_bytes:
+            return Err(
+                DomainError(
+                    code=ErrorCode.ERR_REDACTED_CONTENT_WRITE_BLOCKED,
+                    title="Redacted Secret Placeholder Write Blocked",
+                    detail=(
+                        f"Content for '{rel_posix}' contains redaction placeholder '{redacted_marker}' "
+                        "that was not present in the original file. Writing it back would overwrite "
+                        "and destroy the real secret value. Use fs_patch_file on non-secret lines instead."
+                    ),
+                    context={"path": rel_posix, "placeholder": redacted_marker},
+                )
+            )
 
         new_bytes = content.encode("utf-8")
         new_sha256 = hashlib.sha256(new_bytes).hexdigest()
@@ -551,6 +590,20 @@ class PosixJailFileSystem:
                     code=ErrorCode.ERR_BINARY_FILE,
                     title="Non-UTF8 File Rejected",
                     detail=f"File '{rel_posix}' cannot be patched as UTF-8 text.",
+                )
+            )
+
+        redacted_marker = SecretRedactor.find_redacted_placeholder(replacement)
+        if redacted_marker is not None and redacted_marker not in text:
+            return Err(
+                DomainError(
+                    code=ErrorCode.ERR_REDACTED_CONTENT_WRITE_BLOCKED,
+                    title="Redacted Secret Placeholder Patch Blocked",
+                    detail=(
+                        f"Patch replacement for '{rel_posix}' contains redaction placeholder "
+                        f"'{redacted_marker}', which would destroy the original secret."
+                    ),
+                    context={"path": rel_posix, "placeholder": redacted_marker},
                 )
             )
 

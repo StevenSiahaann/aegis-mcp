@@ -51,6 +51,7 @@ def test_runner_terminates_infinite_loop_and_grandchild_processes_on_timeout(tmp
     policy = SandboxPolicy(
         workspace_root=tmp_path,
         allow_exec=True,
+        allow_subprocess=True,
         default_timeout_seconds=0.35,
         max_timeout_seconds=2.0,
     )
